@@ -1,197 +1,194 @@
-import os
-import json
 import logging
-import docker
-import subprocess
+import json
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from typing import Dict, Optional, List
-import shutil
+import numpy as np
+from swebench.harness.run_evaluation import run_evaluation
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 @dataclass
 class ValidationResult:
-    """Stores validation results for an issue fix"""
     instance_id: str
-    passed: bool
-    test_output: str
-    reasoning_trace: str
+    status: str  # 'success', 'fail', 'skip'
+    patch_content: Optional[str] = None
+    test_outputs: Optional[Dict[str, str]] = None
     error_message: Optional[str] = None
+    reasoning_trace: Optional[str] = None
 
-class SWEValidator:
-    def __init__(self, workspace_dir: str = "data/workspace"):
+class SWEBenchValidator:
+    def __init__(
+        self,
+        submission_dir: str = "submission",
+        workspace_dir: str = "data/workspace"
+    ):
+        self.submission_dir = Path(submission_dir)
         self.workspace_dir = Path(workspace_dir)
-        self.docker_client = docker.from_client()
-        self.submission_dir = Path("submission")
+        self.results: List[ValidationResult] = []
         self.setup_directories()
-        
-    def setup_directories(self):
-        """Create required directories"""
-        os.makedirs(self.workspace_dir, exist_ok=True)
-        os.makedirs(self.submission_dir, exist_ok=True)
-        os.makedirs(self.submission_dir / "logs", exist_ok=True)
-        os.makedirs(self.submission_dir / "trajs", exist_ok=True)
 
-    def validate_solution(self, instance_id: str, patch_content: str, reasoning: str) -> ValidationResult:
-        """Validate a solution using Docker"""
+    def setup_directories(self) -> None:
+        """Create necessary directories"""
+        dirs = [
+            self.submission_dir,
+            self.submission_dir / "predictions",
+            self.submission_dir / "trajs",
+            self.submission_dir / "logs",
+            self.workspace_dir
+        ]
+        for directory in dirs:
+            directory.mkdir(parents=True, exist_ok=True)
+        logger.info("Created directories")
+
+    def validate_solution(
+        self,
+        instance_id: str,
+        patch_content: Optional[str],
+        test_files: List[str],
+        reasoning: str
+    ) -> ValidationResult:
+        """Validate a solution using SWE-bench"""
         try:
-            # Create instance workspace
-            instance_dir = self.workspace_dir / instance_id
-            os.makedirs(instance_dir, exist_ok=True)
-            
-            # Save patch
-            patch_path = instance_dir / "patch.diff"
-            with open(patch_path, "w") as f:
-                f.write(patch_content)
-            
-            # Save reasoning trace
-            traj_path = self.submission_dir / "trajs" / f"{instance_id}.md"
-            with open(traj_path, "w") as f:
-                f.write(reasoning)
-            
-            # Run validation in Docker
-            result = self._run_docker_validation(instance_id, patch_path)
-            
-            # Save logs
-            self._save_logs(instance_id, result)
-            
-            return ValidationResult(
-                instance_id=instance_id,
-                passed=result["passed"],
-                test_output=result["test_output"],
-                reasoning_trace=reasoning,
-                error_message=result.get("error")
+            # Handle skip case
+            if not patch_content:
+                return ValidationResult(
+                    instance_id=instance_id,
+                    status='skip',
+                    reasoning_trace=reasoning
+                )
+
+            # Save files
+            self._save_reasoning_trace(instance_id, reasoning)
+            validation_result = self._run_swebench_validation(
+                instance_id, patch_content, test_files
             )
-            
+
+            self.results.append(validation_result)
+            return validation_result
+
         except Exception as e:
             logger.error(f"Validation failed for {instance_id}: {str(e)}")
             return ValidationResult(
                 instance_id=instance_id,
-                passed=False,
-                test_output="",
-                reasoning_trace=reasoning,
+                status='fail',
+                error_message=str(e),
+                reasoning_trace=reasoning
+            )
+
+    def _run_swebench_validation(
+        self,
+        instance_id: str,
+        patch_content: str,
+        test_files: List[str]
+    ) -> ValidationResult:
+        """Run validation using SWE-bench"""
+        try:
+            # Setup paths
+            instance_dir = self.workspace_dir / instance_id
+            instance_dir.mkdir(parents=True, exist_ok=True)
+            
+            patch_path = instance_dir / "patch.diff"
+            with open(patch_path, "w") as f:
+                f.write(patch_content)
+
+            # Run SWE-bench evaluation
+            result = run_evaluation(
+                instance_ids=[instance_id],
+                patch_path=str(patch_path),
+                max_workers=1
+            )
+
+            # Parse results
+            status = 'success' if result.get('passed', False) else 'fail'
+            test_outputs = result.get('test_outputs', {})
+            error = result.get('error', None)
+
+            return ValidationResult(
+                instance_id=instance_id,
+                status=status,
+                patch_content=patch_content,
+                test_outputs=test_outputs,
+                error_message=error
+            )
+
+        except Exception as e:
+            logger.error(f"SWE-bench validation failed: {str(e)}")
+            return ValidationResult(
+                instance_id=instance_id,
+                status='fail',
                 error_message=str(e)
             )
 
-    def _run_docker_validation(self, instance_id: str, patch_path: Path) -> Dict:
-        """Run validation inside Docker container"""
+    def _save_reasoning_trace(self, instance_id: str, reasoning: str) -> None:
+        """Save reasoning trace"""
         try:
-            # Pull SWE-bench evaluation image
-            self.docker_client.images.pull("swebench/evaluation:latest")
+            trace_path = self.submission_dir / "trajs" / f"{instance_id}.md"
+            with open(trace_path, "w") as f:
+                f.write(reasoning)
+        except Exception as e:
+            logger.error(f"Failed to save reasoning: {str(e)}")
+
+    def calculate_score(self) -> float:
+        """Calculate competition score"""
+        try:
+            a = sum(1 for r in self.results if r.status == 'success')
+            b = sum(1 for r in self.results if r.status == 'fail')
+            c = sum(1 for r in self.results if r.status == 'skip')
             
-            # Run validation
-            container = self.docker_client.containers.run(
-                "swebench/evaluation:latest",
-                command=f"python -m swebench.harness.run_evaluation "
-                       f"--instance_ids {instance_id} "
-                       f"--patch_path {patch_path}",
-                volumes={
-                    str(self.workspace_dir): {"bind": "/workspace", "mode": "rw"}
-                },
-                detach=True
-            )
+            if a + b + c == 0:
+                return 0.0
             
-            # Wait for completion
-            container.wait()
-            
-            # Get logs
-            logs = container.logs().decode()
-            
-            # Parse results
-            results_path = self.workspace_dir / instance_id / "report.json"
-            if results_path.exists():
-                with open(results_path) as f:
-                    results = json.load(f)
-            else:
-                results = {"passed": False, "error": "No results file generated"}
-            
-            # Cleanup
-            container.remove()
-            
-            results["test_output"] = logs
-            return results
+            return (a - b) / (a + b + c)
             
         except Exception as e:
-            logger.error(f"Docker validation failed: {str(e)}")
-            return {
-                "passed": False,
-                "error": str(e),
-                "test_output": ""
-            }
+            logger.error(f"Score calculation failed: {str(e)}")
+            return 0.0
 
-    def _save_logs(self, instance_id: str, result: Dict):
-        """Save validation logs in submission format"""
+    def save_submission(self) -> None:
+        """Save Kaggle submission files"""
         try:
-            # Create logs directory
-            log_dir = self.submission_dir / "logs" / instance_id
-            os.makedirs(log_dir, exist_ok=True)
-            
-            # Save test output
-            with open(log_dir / "test_output.txt", "w") as f:
-                f.write(result["test_output"])
-            
-            # Save report
-            with open(log_dir / "report.json", "w") as f:
-                json.dump(result, f, indent=2)
-            
-        except Exception as e:
-            logger.error(f"Failed to save logs for {instance_id}: {str(e)}")
-
-    def save_predictions(self, results: List[ValidationResult]):
-        """Save predictions in submission format"""
-        try:
-            predictions = [
-                {
-                    "instance_id": r.instance_id,
-                    "passed": r.passed,
-                    "test_output": r.test_output
+            predictions = {
+                r.instance_id: {
+                    "status": r.status,
+                    "patch": r.patch_content if r.patch_content else "",
+                    "error": r.error_message if r.error_message else ""
                 }
-                for r in results
-            ]
-            
-            with open(self.submission_dir / "all_preds.jsonl", "w") as f:
-                for pred in predictions:
-                    f.write(json.dumps(pred) + "\n")
-                    
-        except Exception as e:
-            logger.error(f"Failed to save predictions: {str(e)}")
-
-    def create_metadata(self, name: str, is_open_source: bool, site_url: str):
-        """Create metadata.yaml for submission"""
-        try:
-            metadata = {
-                "name": name,
-                "oss": is_open_source,
-                "site": site_url,
-                "verified": False
+                for r in self.results
             }
             
-            with open(self.submission_dir / "metadata.yaml", "w") as f:
-                json.dump(metadata, f, indent=2)
-                
+            with open(self.submission_dir / "predictions.json", "w") as f:
+                json.dump(predictions, f, indent=2)
+
+            score = self.calculate_score()
+            with open(self.submission_dir / "score.json", "w") as f:
+                json.dump({"score": score}, f, indent=2)
+
+            logger.info(f"Saved submission (score: {score:.4f})")
+
         except Exception as e:
-            logger.error(f"Failed to create metadata: {str(e)}")
+            logger.error(f"Failed to save submission: {str(e)}")
+            raise
 
 def main():
-    """Example usage"""
-    validator = SWEValidator()
+    """Test validator"""
+    validator = SWEBenchValidator()
     
-    # Example validation
+    # Test validation
     result = validator.validate_solution(
         instance_id="test-1",
         patch_content="Example patch",
-        reasoning="Reasoning steps..."
+        test_files=["test1.py"],
+        reasoning="Test reasoning"
     )
     
-    # Save results
-    validator.save_predictions([result])
-    validator.create_metadata(
-        name="MyAgent",
-        is_open_source=True,
-        site_url="https://github.com/myuser/myagent"
-    )
+    validator.save_submission()
+    print(f"Score: {validator.calculate_score():.4f}")
 
 if __name__ == "__main__":
     main()
+
