@@ -1,0 +1,8 @@
+# requirements.txt
+transformers==4.36.2
+datasets==2.15.0
+torch>=2.1.0
+numpy>=1.24.0
+accelerate  # For better GPU handling
+typing-extensions
+tqdm
